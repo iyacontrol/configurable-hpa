@@ -1,0 +1,21 @@
+apiVersion: autoscalers.postmates.com/v1beta1
+kind: CHPA
+metadata:
+  labels:
+    controller-tools.k8s.io: "1.0"
+  name: elastichd
+  namespace: sgt
+spec:
+  downscaleForbiddenWindowSeconds: 15
+  upscaleForbiddenWindowSeconds: 15
+  scaleTargetRef:
+    apiVersion: "apps/v1"
+    kind: Deployment
+    name: elastichd
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        targetAverageUtilization: 10

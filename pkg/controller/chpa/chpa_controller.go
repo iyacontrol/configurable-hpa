@@ -29,18 +29,25 @@ import (
 	"github.com/golang/glog"
 
 	chpav1beta1 "github.com/postmates/configurable-hpa/pkg/apis/autoscalers/v1beta1"
-	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2beta1"
 	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/labels"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	discocache "k8s.io/client-go/discovery/cached"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/restmapper"
+	"k8s.io/client-go/scale"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/kubernetes/pkg/controller/podautoscaler/metrics"
 	resourceclient "k8s.io/metrics/pkg/client/clientset_generated/clientset/typed/metrics/v1beta1"
@@ -48,7 +55,6 @@ import (
 	"k8s.io/metrics/pkg/client/external_metrics"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -86,6 +92,16 @@ func newReconciler(mgr manager.Manager) reconcile.Reconciler {
 		log.Fatal(err)
 	}
 
+	// init the scaleClient
+	cachedDiscovery := discocache.NewMemCacheClient(clientSet.Discovery())
+	restMapper := restmapper.NewDeferredDiscoveryRESTMapper(cachedDiscovery)
+	restMapper.Reset()
+	scaleKindResolver := scale.NewDiscoveryScaleKindResolver(clientSet.Discovery())
+	scaleClient, err := scale.NewForConfig(clientConfig, restMapper, dynamic.LegacyAPIPathResolverFunc, scaleKindResolver)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	evtNamespacer := clientSet.CoreV1()
 	broadcaster := record.NewBroadcaster()
 	broadcaster.StartLogging(glog.Infof)
@@ -94,9 +110,10 @@ func newReconciler(mgr manager.Manager) reconcile.Reconciler {
 
 	replicaCalc := NewReplicaCalculator(metricsClient, clientSet.CoreV1(), defaultTolerance)
 	return &ReconcileCHPA{
-		Client:        mgr.GetClient(),
+		client:        mgr.GetClient(),
+		scaleClient:   scaleClient,
+		restMapper:    restMapper,
 		scheme:        mgr.GetScheme(),
-		clientSet:     clientSet,
 		replicaCalc:   replicaCalc,
 		eventRecorder: recorder,
 		syncPeriod:    defaultSyncPeriod,
@@ -140,10 +157,11 @@ var _ reconcile.Reconciler = &ReconcileCHPA{}
 
 // ReconcileCHPA reconciles a CHPA object
 type ReconcileCHPA struct {
-	client.Client
+	client client.Client
 	//replicaCalculator *podautoscaler.ReplicaCalculator
 	scheme        *runtime.Scheme
-	clientSet     kubernetes.Interface
+	scaleClient   scale.ScalesGetter
+	restMapper    apimeta.RESTMapper
 	syncPeriod    time.Duration
 	eventRecorder record.EventRecorder
 	replicaCalc   *ReplicaCalculator
@@ -171,7 +189,7 @@ func (r *ReconcileCHPA) Reconcile(request reconcile.Request) (reconcile.Result, 
 	resStop := reconcile.Result{}
 
 	chpa := &chpav1beta1.CHPA{}
-	err := r.Get(context.TODO(), request.NamespacedName, chpa)
+	err := r.client.Get(context.TODO(), request.NamespacedName, chpa)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			// Object not found, return.  Do not repeat the Reconcile again
@@ -194,24 +212,7 @@ func (r *ReconcileCHPA) Reconcile(request reconcile.Request) (reconcile.Result, 
 	}
 	log.Printf("-> chpa: %v\n", chpa.String())
 
-	// kind := chpa.Spec.ScaleTargetRef.Kind
-	namespace := chpa.Namespace
-	name := chpa.Spec.ScaleTargetRef.Name
-	namespacedName := types.NamespacedName{Namespace: namespace, Name: name}
-
-	deploy := &appsv1.Deployment{}
-	if err := r.Get(context.TODO(), namespacedName, deploy); err != nil {
-		// Error reading the object, repeat later
-		log.Printf("Error reading Deployment '%v': %v", namespacedName, err)
-		return resRepeat, nil
-	}
-	if err := controllerutil.SetControllerReference(chpa, deploy, r.scheme); err != nil {
-		// Error communicating with apiserver, repeat later
-		log.Printf("Can't set the controller reference for the deployment %v: %v", namespacedName, err)
-		return resRepeat, nil
-	}
-
-	if err := r.reconcileCHPA(chpa, deploy); err != nil {
+	if err := r.reconcileCHPA(chpa); err != nil {
 		// Should never happen, actually.
 		log.Printf(err.Error())
 		r.eventRecorder.Event(chpa, v1.EventTypeWarning, "FailedProcessCHPA", err.Error())
@@ -222,14 +223,36 @@ func (r *ReconcileCHPA) Reconcile(request reconcile.Request) (reconcile.Result, 
 }
 
 // Function returns an error only when we need to stop working with the CHPA spec
-func (r *ReconcileCHPA) reconcileCHPA(chpa *chpav1beta1.CHPA, deploy *appsv1.Deployment) (err error) {
+func (r *ReconcileCHPA) reconcileCHPA(chpa *chpav1beta1.CHPA) (err error) {
 	defer func() {
 		if err1 := recover(); err1 != nil {
 			err = fmt.Errorf("RunTime error in reconcileCHPA: %s", err1)
 		}
 	}()
-	currentReplicas := deploy.Status.Replicas
-	log.Printf("-> deploy: {%v/%v replicas:%v}\n", deploy.Namespace, deploy.Name, currentReplicas)
+
+	// the following line are here to retrieve the GVK of the target ref
+	targetGV, err := schema.ParseGroupVersion(chpa.Spec.ScaleTargetRef.APIVersion)
+	if err != nil {
+		return fmt.Errorf("invalid API version in scale target reference: %v", err)
+	}
+	targetGK := schema.GroupKind{
+		Group: targetGV.Group,
+		Kind:  chpa.Spec.ScaleTargetRef.Kind,
+	}
+	mappings, err := r.restMapper.RESTMappings(targetGK)
+	if err != nil {
+		return fmt.Errorf("unable to determine resource for scale target reference: %v", err)
+	}
+
+	currentScale, targetGR, err := r.getScaleForResourceMappings(chpa.Namespace, chpa.Spec.ScaleTargetRef.Name, mappings)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return err
+		}
+	}
+
+	currentReplicas := currentScale.Status.Replicas
+	log.Printf("-> deploy: {%v/%v replicas:%v}\n", chpa.Namespace, chpa.Spec.ScaleTargetRef.Name, currentReplicas)
 	chpaStatusOriginal := chpa.Status.DeepCopy()
 
 	reference := fmt.Sprintf("%s/%s/%s", chpa.Spec.ScaleTargetRef.Kind, chpa.Namespace, chpa.Spec.ScaleTargetRef.Name)
@@ -247,7 +270,7 @@ func (r *ReconcileCHPA) reconcileCHPA(chpa *chpav1beta1.CHPA, deploy *appsv1.Dep
 
 	rescale := true
 
-	if *deploy.Spec.Replicas == 0 {
+	if currentScale.Spec.Replicas == 0 {
 		// Autoscaling is disabled for this resource
 		desiredReplicas = 0
 		rescale = false
@@ -262,7 +285,7 @@ func (r *ReconcileCHPA) reconcileCHPA(chpa *chpav1beta1.CHPA, deploy *appsv1.Dep
 		rescaleReason = "Current number of replicas must be greater than 0"
 		desiredReplicas = 1
 	} else {
-		metricDesiredReplicas, metricName, metricStatuses, metricTimestamp, err = r.computeReplicasForMetrics(chpa, deploy, chpa.Spec.Metrics)
+		metricDesiredReplicas, metricName, metricStatuses, metricTimestamp, err = r.computeReplicasForMetrics(chpa, currentScale, chpa.Spec.Metrics)
 		if err != nil {
 			r.setCurrentReplicasInStatus(chpa, currentReplicas)
 			if err := r.updateStatusIfNeeded(chpaStatusOriginal, chpa); err != nil {
@@ -321,8 +344,8 @@ func (r *ReconcileCHPA) reconcileCHPA(chpa *chpav1beta1.CHPA, deploy *appsv1.Dep
 	}
 
 	if rescale {
-		deploy.Spec.Replicas = &desiredReplicas
-		if err := r.Update(context.TODO(), deploy); err != nil {
+		currentScale.Spec.Replicas = desiredReplicas
+		if _, err := r.scaleClient.Scales(chpa.Namespace).Update(targetGR, currentScale); err != nil {
 			r.eventRecorder.Eventf(chpa, v1.EventTypeWarning, "FailedRescale", "New size: %d; reason: %s; error: %v", desiredReplicas, rescaleReason, err.Error())
 			setCondition(chpa, autoscalingv2.AbleToScale, v1.ConditionFalse, "FailedUpdateScale", "the HPA controller was unable to update the target scale: %v", err)
 			r.setCurrentReplicasInStatus(chpa, currentReplicas)
@@ -565,20 +588,19 @@ func (r *ReconcileCHPA) shouldScale(chpa *chpav1beta1.CHPA, currentReplicas, des
 	return false
 }
 
-func (r *ReconcileCHPA) computeReplicasForMetrics(chpa *chpav1beta1.CHPA, deploy *appsv1.Deployment, metricSpecs []autoscalingv2.MetricSpec) (replicas int32, metric string, statuses []autoscalingv2.MetricStatus, timestamp time.Time, err error) {
-	currentReplicas := deploy.Status.Replicas
-
+func (r *ReconcileCHPA) computeReplicasForMetrics(chpa *chpav1beta1.CHPA, scale *autoscalingv1.Scale, metricSpecs []autoscalingv2.MetricSpec) (replicas int32, metric string, statuses []autoscalingv2.MetricStatus, timestamp time.Time, err error) {
+	currentReplicas := scale.Spec.Replicas
 	statuses = make([]autoscalingv2.MetricStatus, len(metricSpecs))
 
 	for i, metricSpec := range metricSpecs {
-		if deploy.Spec.Selector == nil {
+		if scale.Status.Selector == "" {
 			errMsg := "selector is required"
 			r.eventRecorder.Event(chpa, v1.EventTypeWarning, "SelectorRequired", errMsg)
 			setCondition(chpa, autoscalingv2.ScalingActive, v1.ConditionFalse, "InvalidSelector", "the CHPA target's deploy is missing a selector")
 			return 0, "", nil, time.Time{}, fmt.Errorf(errMsg)
 		}
 
-		selector, err := metav1.LabelSelectorAsSelector(deploy.Spec.Selector)
+		selector, err := labels.Parse(scale.Status.Selector)
 		if err != nil {
 			errMsg := fmt.Sprintf("couldn't convert selector into a corresponding internal selector object: %v", err)
 			r.eventRecorder.Event(chpa, v1.EventTypeWarning, "InvalidSelector", errMsg)
@@ -735,7 +757,7 @@ func (r *ReconcileCHPA) updateStatusIfNeeded(oldStatus *chpav1beta1.CHPAStatus, 
 }
 
 func (r *ReconcileCHPA) updateCHPA(chpa *chpav1beta1.CHPA) error {
-	return r.Update(context.TODO(), chpa)
+	return r.client.Update(context.TODO(), chpa)
 }
 
 // getLastScaleTime returns the chpa's last scale time or the chpa's creation time if the last scale time is nil.
@@ -745,4 +767,29 @@ func getLastScaleTime(chpa *chpav1beta1.CHPA) time.Time {
 		lastScaleTime = &chpa.CreationTimestamp
 	}
 	return lastScaleTime.Time
+}
+
+// getScaleForResourceMappings attempts to fetch the scale for the
+// resource with the given name and namespace, trying each RESTMapping
+// in turn until a working one is found.  If none work, the first error
+// is returned.  It returns both the scale, as well as the group-resource from
+// the working mapping.
+func (r *ReconcileCHPA) getScaleForResourceMappings(namespace, name string, mappings []*apimeta.RESTMapping) (*autoscalingv1.Scale, schema.GroupResource, error) {
+	var errs []error
+	var scale *autoscalingv1.Scale
+	var targetGR schema.GroupResource
+	for _, mapping := range mappings {
+		var err error
+		targetGR = mapping.Resource.GroupResource()
+		scale, err = r.scaleClient.Scales(namespace).Get(targetGR, name)
+		if err == nil {
+			break
+		}
+		errs = append(errs, err)
+	}
+	if scale == nil {
+		errs = append(errs, fmt.Errorf("scale not found"))
+	}
+	// make sure we handle an empty set of mappings
+	return scale, targetGR, utilerrors.NewAggregate(errs)
 }
